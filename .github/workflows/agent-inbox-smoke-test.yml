@@ -1,0 +1,116 @@
+name: Agent Inbox Smoke Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: 'Read-only source or reporting-health scenario'
+        required: true
+        type: choice
+        default: live
+        options:
+          - live
+          - sample
+          - stale-source
+          - failed-source
+
+# This workflow is deliberately manual-only and read-only. Unspecified token
+# permissions are set to none.
+permissions:
+  actions: read
+  pull-requests: read
+
+jobs:
+  smoke-test:
+    name: Generate read-only inbox smoke report
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Query sources and report health
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SCENARIO: ${{ inputs.scenario }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          summary() {
+            printf '%s\n' "$1" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          summary '## Agent Inbox Smoke Test'
+          summary ''
+          summary "- Repository: \`$GH_REPO\`"
+          summary "- Scenario: \`$SCENARIO\`"
+          summary "- Report generated (UTC): \`$(date -u '+%Y-%m-%d %H:%M:%S')\`"
+          summary '- Mode: read-only; no GitHub objects were changed.'
+          summary ''
+
+          case "$SCENARIO" in
+            live)
+              if ! pull_requests="$(gh pr list --repo "$GH_REPO" --state open --limit 100 --json number,isDraft,updatedAt 2>/dev/null)"; then
+                summary '**Source status: FAILED** — pull request query was inaccessible or failed; this is not an empty queue.'
+                exit 1
+              fi
+
+              if ! workflow_runs="$(gh run list --repo "$GH_REPO" --all --limit 100 --json databaseId,status,conclusion,createdAt 2>/dev/null)"; then
+                summary '**Source status: FAILED** — workflow run query was inaccessible or failed; this is not an empty queue.'
+                exit 1
+              fi
+
+              open_pr_count="$(jq 'length' <<< "$pull_requests")"
+              draft_pr_count="$(jq '[.[] | select(.isDraft == true)] | length' <<< "$pull_requests")"
+              run_count="$(jq 'length' <<< "$workflow_runs")"
+              failed_run_count="$(jq --arg run_id "$CURRENT_RUN_ID" '[.[] | select((.databaseId | tostring) != $run_id) | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "action_required")] | length' <<< "$workflow_runs")"
+
+              summary '**Source status: FRESH** — both read-only GitHub queries succeeded.'
+              summary ''
+              summary '| Queue signal | Count |'
+              summary '|---|---:|'
+              summary "| Open pull requests | $open_pr_count |"
+              summary "| Draft pull requests | $draft_pr_count |"
+              summary "| Workflow runs in latest 100 | $run_count |"
+              summary "| Failed/timed-out workflow runs (excluding this smoke run) | $failed_run_count |"
+
+              if [[ "$open_pr_count" -ge 100 || "$run_count" -ge 100 ]]; then
+                summary ''
+                summary '**Queue state: PARTIAL** — at least one source reached the 100-item query limit; do not treat this report as a complete empty queue.'
+              elif [[ "$open_pr_count" -eq 0 && "$failed_run_count" -eq 0 ]]; then
+                summary ''
+                summary '**Queue state: EMPTY** — sources were reachable and returned no actionable PR or failed-run items.'
+              else
+                summary ''
+                summary '**Queue state: ITEMS FOUND** — inspect the source repository for human decisions.'
+              fi
+              ;;
+
+            sample)
+              summary '**Source status: SIMULATED FIXTURE** — the following items are synthetic, not GitHub data.'
+              summary ''
+              summary '| Type | Object | State | Reason for attention | Suggested next action |'
+              summary '|---|---|---|---|---|'
+              summary '| Pull request | Fixture PR #123 | Awaiting human review | Review decision pending | Review the PR in the source system |'
+              summary '| CI | Fixture run #456 | Failed | A required check failed | Inspect the run and decide whether action is needed |'
+              ;;
+
+            stale-source)
+              last_success="$(date -u -d '2 hours ago' '+%Y-%m-%d %H:%M:%S UTC')"
+              summary '**Source status: STALE (SIMULATED FIXTURE)** — last successful refresh was more than the 60-minute test threshold ago.'
+              summary "- Simulated last success: \`$last_success\`"
+              summary '- The report does not present this source as an empty queue.'
+              ;;
+
+            failed-source)
+              summary '**Source status: FAILED (SIMULATED FIXTURE)** — the source error is visible and must not be interpreted as an empty queue.'
+              summary ''
+              summary 'This scenario intentionally exits nonzero so the failed-source path is visible in Actions.'
+              exit 1
+              ;;
+
+            *)
+              summary '**Source status: FAILED** — unsupported scenario.'
+              exit 2
+              ;;
+          esac
