@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "timeoutSeconds": 600,
+  "checks": {
+    "install": ["node", "--version"],
+    "lint": ["node", "--check", "src/todo.mjs"],
+    "typecheck": ["node", "--check", "src/app.mjs"],
+    "test": ["node", "--test", "tests/todo-acceptance.test.mjs"],
+    "build": ["node", "--check", "src/app.mjs"]
+  }
+}

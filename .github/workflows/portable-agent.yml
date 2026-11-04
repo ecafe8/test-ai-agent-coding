@@ -1,0 +1,368 @@
+name: Portable OpenCode Agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Open issue number
+        required: true
+        type: string
+      expected_sha:
+        description: Full SHA of the default branch to authorize
+        required: true
+        type: string
+      allowed_paths:
+        description: JSON array of exact allowed file paths (required for execution)
+        required: false
+        type: string
+      approval_comment_id:
+        description: ID of the structured approval comment (required for execution)
+        required: false
+        type: string
+      project_owner:
+        description: Confirmed board owner (required for execution)
+        required: false
+        type: string
+      project_number:
+        description: Confirmed board number (required for execution)
+        required: false
+        type: string
+      budget_cents:
+        description: Approved provider budget in minor units (requires provider-enforced cap)
+        required: false
+        type: string
+      budget_currency:
+        description: Budget currency (CNY or USD)
+        required: false
+        type: string
+      execute:
+        description: Run OpenCode and create a draft PR (otherwise preview only)
+        type: boolean
+        default: false
+      simulate:
+        description: Run an offline fake-agent Todo simulation after preview (no PR)
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: portable-agent-${{ github.event.inputs.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      base_sha: ${{ steps.authorize.outputs.sha }}
+      branch: ${{ steps.authorize.outputs.branch }}
+      issue_digest: ${{ steps.snapshot.outputs.digest }}
+      approval_digest: ${{ steps.board-approval.outputs.digest }}
+      session: ${{ steps.claim.outputs.session }}
+      execute: ${{ inputs.execute }}
+    env:
+      ISSUE_NUMBER: ${{ inputs.issue_number }}
+      EXPECTED_SHA: ${{ inputs.expected_sha }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      ACTOR: ${{ github.actor }}
+      TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+      REF_NAME: ${{ github.ref_name }}
+      WORKFLOW_SHA: ${{ github.sha }}
+      APPROVAL_COMMENT_ID: ${{ inputs.approval_comment_id }}
+      PROJECT_OWNER: ${{ inputs.project_owner }}
+      PROJECT_NUMBER: ${{ inputs.project_number }}
+      AGENT_ALLOWED_PATHS: ${{ inputs.allowed_paths }}
+      AGENT_WORKFLOW_MODEL: ${{ vars.AGENT_WORKFLOW_MODEL || secrets.AGENT_WORKFLOW_MODEL }}
+      AGENT_MAX_STEPS: ${{ vars.AGENT_MAX_STEPS || '50' }}
+      AGENT_BUDGET_CENTS: ${{ inputs.budget_cents }}
+      AGENT_BUDGET_CURRENCY: ${{ inputs.budget_currency }}
+    steps:
+      - name: Block execution until board authorization is implemented
+        if: inputs.execute
+        run: |
+          echo 'Execution disabled: board-gated authorization and security review are not implemented.'
+          exit 1
+      - name: Authorize and pin default branch
+        id: authorize
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          REF_NAME: ${{ github.ref_name }}
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo 'Invalid issue number'; exit 1; }
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo 'Expected a full lowercase SHA'; exit 1; }
+          [[ "$REF_NAME" == "$DEFAULT_BRANCH" ]] || { echo 'Run only from the default branch'; exit 1; }
+          [[ "$TRIGGERING_ACTOR" == "$ACTOR" ]] || { echo 'A different user cannot rerun this authorization'; exit 1; }
+          permission=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$ACTOR/permission" --jq .permission)
+          [[ "$permission" == admin || "$permission" == maintain ]] || { echo 'Admin or maintainer authorization required'; exit 1; }
+          current=$(gh api "repos/$GITHUB_REPOSITORY/commits/$DEFAULT_BRANCH" --jq .sha)
+          [[ "$current" == "$EXPECTED_SHA" ]] || { echo 'Default branch changed; reauthorize with its current SHA'; exit 1; }
+          [[ "$WORKFLOW_SHA" == "$EXPECTED_SHA" ]] || { echo 'Workflow revision does not match the authorized SHA'; exit 1; }
+          gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER" > "$RUNNER_TEMP/issue.json"
+          jq -e '.state == "open" and (.pull_request | not)' "$RUNNER_TEMP/issue.json" >/dev/null
+          jq -r '"Title: " + .title + "\n\n" + (.body // "")' "$RUNNER_TEMP/issue.json" > "$RUNNER_TEMP/task.txt"
+          echo "sha=$current" >> "$GITHUB_OUTPUT"
+          echo "branch=agent/issue-$ISSUE_NUMBER-${current:0:12}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ steps.authorize.outputs.sha }}
+          persist-credentials: false
+      - name: Validate configuration and preview
+        run: node tools/portable-agent/cli.mjs preview
+      - name: Validate task scope
+        if: inputs.execute
+        env:
+          AGENT_ALLOWED_PATHS: ${{ inputs.allowed_paths }}
+        run: node tools/portable-agent/verify-patch.mjs --check-scope
+      - name: Capture issue content
+        id: snapshot
+        if: inputs.execute
+        env:
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: |
+          set -euo pipefail
+          digest=$(node tools/portable-agent/issue-snapshot.mjs "$RUNNER_TEMP/issue.json" "$ISSUE_NUMBER")
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: Build board manager from the pinned revision
+        if: inputs.execute
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/board-build
+        run: cargo build --locked --manifest-path tools/rust/board-manager/Cargo.toml
+      - name: Verify board and bounded approval
+        id: board-approval
+        if: inputs.execute
+        env:
+          BOARD_MANAGER_BINARY: ${{ runner.temp }}/board-build/debug/board-manager
+          GATE_GITHUB_TOKEN: ${{ github.token }}
+          GATE_PROJECTS_TOKEN: ${{ secrets.AGENT_PROJECTS_TOKEN }}
+          DASHSCOPE_BASE_URL: ${{ vars.DASHSCOPE_BASE_URL || secrets.DASHSCOPE_BASE_URL }}
+          ISSUE_DIGEST: ${{ steps.snapshot.outputs.digest }}
+        run: |
+          set -euo pipefail
+          digest=$(node tools/portable-agent/gate-cli.mjs before-claim)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: Claim approved issue
+        id: claim
+        if: inputs.execute
+        env:
+          GITHUB_PROJECTS_TOKEN: ${{ secrets.AGENT_PROJECTS_TOKEN }}
+          BOARD_MANAGER_BINARY: ${{ runner.temp }}/board-build/debug/board-manager
+          SESSION: portable-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          result=$("$BOARD_MANAGER_BINARY" --config "$GITHUB_WORKSPACE/ai-agents-board.yml" --format json claim "$ISSUE_NUMBER" --agent opencode --session "$SESSION")
+          jq -e --arg session "$SESSION" --argjson issue "$ISSUE_NUMBER" \
+            '.success == true and .issue == $issue and .agent == "opencode" and .session_id == $session' <<< "$result" >/dev/null
+          echo "session=$SESSION" >> "$GITHUB_OUTPUT"
+      - name: Build isolated agent image
+        if: inputs.execute
+        run: docker build -f tools/portable-agent/Dockerfile -t portable-agent:local tools/portable-agent
+      - name: Prepare read-only Alibaba provider configuration
+        if: inputs.execute
+        env:
+          DASHSCOPE_BASE_URL: ${{ vars.DASHSCOPE_BASE_URL || secrets.DASHSCOPE_BASE_URL }}
+        run: |
+          set -euo pipefail
+          umask 077
+          node tools/portable-agent/model-config.mjs > "$RUNNER_TEMP/opencode.json"
+      - name: Recheck authorization and claim before execution
+        if: inputs.execute
+        env:
+          BOARD_MANAGER_BINARY: ${{ runner.temp }}/board-build/debug/board-manager
+          GATE_GITHUB_TOKEN: ${{ github.token }}
+          GATE_PROJECTS_TOKEN: ${{ secrets.AGENT_PROJECTS_TOKEN }}
+          DASHSCOPE_BASE_URL: ${{ vars.DASHSCOPE_BASE_URL || secrets.DASHSCOPE_BASE_URL }}
+          ISSUE_DIGEST: ${{ steps.snapshot.outputs.digest }}
+          APPROVAL_DIGEST: ${{ steps.board-approval.outputs.digest }}
+          AGENT_CLAIM_SESSION: ${{ steps.claim.outputs.session }}
+        run: node tools/portable-agent/gate-cli.mjs running >/dev/null
+      - name: Run OpenCode and project checks
+        if: inputs.execute
+        env:
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          AGENT_WORKFLOW_MODEL: ${{ vars.AGENT_WORKFLOW_MODEL || secrets.AGENT_WORKFLOW_MODEL }}
+          AGENT_MAX_STEPS: ${{ vars.AGENT_MAX_STEPS || '50' }}
+        run: |
+          set -euo pipefail
+          [[ -n "$DASHSCOPE_API_KEY" && -n "$AGENT_WORKFLOW_MODEL" ]] || { echo 'Missing model or provider credential'; exit 1; }
+          mkdir -p "$RUNNER_TEMP/agent-workspace"
+          rsync -a --exclude='/.git' "$GITHUB_WORKSPACE/" "$RUNNER_TEMP/agent-workspace/"
+          if ! docker run --rm --init --cpus=2 --memory=4g --pids-limit=512 \
+            --cap-drop=ALL --security-opt=no-new-privileges --read-only \
+            --tmpfs /tmp:rw,nosuid,nodev,size=2g --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp -e DASHSCOPE_API_KEY -e AGENT_WORKFLOW_MODEL -e AGENT_MAX_STEPS \
+            -v "$RUNNER_TEMP/agent-workspace:/workspace" \
+            -v "$RUNNER_TEMP/task.txt:/input/task.txt:ro" \
+            -v "$RUNNER_TEMP/opencode.json:/etc/opencode/opencode.json:ro" \
+            portable-agent:local run /input/task.txt > "$RUNNER_TEMP/agent-report.json"; then
+            echo 'Agent execution or project checks failed; no patch will be published.'
+            exit 1
+          fi
+          echo 'OpenCode and all configured checks completed successfully.'
+      - name: Generate and verify patch
+        if: inputs.execute
+        env:
+          AGENT_ALLOWED_PATHS: ${{ inputs.allowed_paths }}
+        run: |
+          set -euo pipefail
+          cp tools/portable-agent/verify-patch.mjs "$RUNNER_TEMP/verify-patch.mjs"
+          rsync -a --delete --exclude='/.git' "$RUNNER_TEMP/agent-workspace/" "$GITHUB_WORKSPACE/"
+          git -c core.hooksPath=/dev/null add -A
+          node "$RUNNER_TEMP/verify-patch.mjs"
+          git diff --cached --binary --no-renames > "$RUNNER_TEMP/agent.patch"
+          [[ $(wc -c < "$RUNNER_TEMP/agent.patch") -le 1048576 ]] || { echo 'Patch exceeds 1 MiB'; exit 1; }
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        if: inputs.execute
+        with:
+          name: portable-agent-patch
+          path: ${{ runner.temp }}/agent.patch
+          if-no-files-found: error
+          retention-days: 1
+      - name: Report potential claim recovery
+        if: failure() && inputs.execute
+        run: echo 'The claim step may have partially succeeded; inspect the issue and board before retrying.'
+
+  simulate:
+    needs: agent
+    if: inputs.simulate && !inputs.execute
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.agent.outputs.base_sha }}
+          persist-credentials: false
+      - name: Run deterministic offline Todo simulation
+        run: node --test tools/portable-agent/todo-simulation.test.mjs
+
+  verify:
+    needs: agent
+    if: needs.agent.outputs.execute == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.agent.outputs.base_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: portable-agent-patch
+          path: ${{ runner.temp }}/portable-agent-patch
+      - name: Validate patch and independently rerun checks without credentials
+        env:
+          AGENT_ALLOWED_PATHS: ${{ inputs.allowed_paths }}
+        run: |
+          set -euo pipefail
+          patch="$RUNNER_TEMP/portable-agent-patch/agent.patch"
+          [[ $(wc -c < "$patch") -le 1048576 ]] || { echo 'Patch exceeds 1 MiB'; exit 1; }
+          cp tools/portable-agent/verify-patch.mjs "$RUNNER_TEMP/verify-patch.mjs"
+          git apply --check --index "$patch"
+          git apply --index "$patch"
+          node "$RUNNER_TEMP/verify-patch.mjs"
+          mkdir -p "$RUNNER_TEMP/check-workspace"
+          rsync -a --exclude='/.git' "$GITHUB_WORKSPACE/" "$RUNNER_TEMP/check-workspace/"
+          if ! docker run --rm --init --network none --cpus=2 --memory=4g --pids-limit=512 \
+            --cap-drop=ALL --security-opt=no-new-privileges --read-only \
+            --tmpfs /tmp:rw,nosuid,nodev,size=2g --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp -v "$RUNNER_TEMP/check-workspace:/workspace" -w /workspace \
+            node:22-bookworm node tools/portable-agent/cli.mjs checks > "$RUNNER_TEMP/check-report.json"; then
+            echo 'Independent project checks failed; no PR will be published.'
+            exit 1
+          fi
+          echo 'Independent project checks passed without network or model credentials.'
+
+  publish:
+    needs: [agent, verify]
+    if: needs.agent.outputs.execute == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      issues: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.agent.outputs.base_sha }}
+          persist-credentials: false
+      - name: Build board manager from the pinned revision
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/board-build
+        run: cargo build --locked --manifest-path tools/rust/board-manager/Cargo.toml
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: portable-agent-patch
+          path: ${{ runner.temp }}/portable-agent-patch
+      - name: Validate and publish draft PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA: ${{ needs.agent.outputs.base_sha }}
+          BRANCH: ${{ needs.agent.outputs.branch }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          ISSUE_DIGEST: ${{ needs.agent.outputs.issue_digest }}
+          AGENT_ALLOWED_PATHS: ${{ inputs.allowed_paths }}
+          APPROVAL_COMMENT_ID: ${{ inputs.approval_comment_id }}
+          PROJECT_OWNER: ${{ inputs.project_owner }}
+          PROJECT_NUMBER: ${{ inputs.project_number }}
+          AGENT_WORKFLOW_MODEL: ${{ vars.AGENT_WORKFLOW_MODEL || secrets.AGENT_WORKFLOW_MODEL }}
+          AGENT_BUDGET_CENTS: ${{ inputs.budget_cents }}
+          AGENT_BUDGET_CURRENCY: ${{ inputs.budget_currency }}
+          DASHSCOPE_BASE_URL: ${{ vars.DASHSCOPE_BASE_URL || secrets.DASHSCOPE_BASE_URL }}
+          REF_NAME: ${{ github.ref_name }}
+          WORKFLOW_SHA: ${{ github.sha }}
+          BOARD_MANAGER_BINARY: ${{ runner.temp }}/board-build/debug/board-manager
+          GATE_GITHUB_TOKEN: ${{ github.token }}
+          GATE_PROJECTS_TOKEN: ${{ secrets.AGENT_PROJECTS_TOKEN }}
+          APPROVAL_DIGEST: ${{ needs.agent.outputs.approval_digest }}
+          AGENT_CLAIM_SESSION: ${{ needs.agent.outputs.session }}
+        run: |
+          set -euo pipefail
+          recheck_state() {
+            node tools/portable-agent/gate-cli.mjs running >/dev/null || return 1
+            [[ "$TRIGGERING_ACTOR" == "$ACTOR" ]] || { echo 'A different user cannot rerun this authorization'; return 1; }
+            local permission current
+            permission=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$ACTOR/permission") || return 1
+            permission=$(jq -er '.permission' <<< "$permission") || return 1
+            [[ "$permission" == admin || "$permission" == maintain ]] || { echo 'Authorization was revoked'; return 1; }
+            current=$(gh api "repos/$GITHUB_REPOSITORY/commits/$DEFAULT_BRANCH" --jq .sha) || return 1
+            [[ "$current" == "$EXPECTED_SHA" ]] || { echo 'Default branch changed; reauthorization required'; return 1; }
+            gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER" > "$RUNNER_TEMP/current-issue.json" || return 1
+            node tools/portable-agent/issue-snapshot.mjs "$RUNNER_TEMP/current-issue.json" "$ISSUE_NUMBER" "$ISSUE_DIGEST" >/dev/null || return 1
+          }
+          recheck_state
+          existing=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [[ -n "$existing" ]]; then echo "Draft PR already exists: #$existing"; exit 0; fi
+          patch="$RUNNER_TEMP/portable-agent-patch/agent.patch"
+          [[ $(wc -c < "$patch") -le 1048576 ]] || { echo 'Patch exceeds 1 MiB'; exit 1; }
+          cp tools/portable-agent/verify-patch.mjs "$RUNNER_TEMP/publisher-verify-patch.mjs"
+          git apply --check --index "$patch"
+          git apply --index "$patch"
+          node "$RUNNER_TEMP/publisher-verify-patch.mjs"
+          git config user.name 'Agent Workflow'
+          git config user.email 'agent-workflow@users.noreply.github.com'
+          git -c core.hooksPath=/dev/null commit -m "Implement issue #$ISSUE_NUMBER"
+          gh auth setup-git
+          recheck_state
+          git -c core.hooksPath=/dev/null push origin "HEAD:refs/heads/$BRANCH"
+          recheck_state || { echo 'State changed or could not be verified after push; no PR created'; exit 1; }
+          printf 'Automated changes for issue #%s.\n\nConfigured checks passed in a separate credential-free verification job. Review this draft and PR CI results before merging.\n\nWorkflow run: %s/%s/actions/runs/%s\n' \
+            "$ISSUE_NUMBER" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" > "$RUNNER_TEMP/pr-body.md"
+          gh pr create --draft --base "$DEFAULT_BRANCH" --head "$BRANCH" --title "Implement issue #$ISSUE_NUMBER" --body-file "$RUNNER_TEMP/pr-body.md"

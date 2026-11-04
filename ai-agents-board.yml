@@ -1,0 +1,23 @@
+{
+  "project": {
+    "owner": "ecafe8",
+    "number": 1
+  },
+  "repository": "ecafe8/test-ai-agent-coding",
+  "agents": {
+    "enabled_agents": [
+      "opencode"
+    ],
+    "auto_discover": false
+  },
+  "work_claims": {
+    "timeout": 14400,
+    "renewal_interval": 3600
+  },
+  "work_queue": {
+    "exclude_labels": [
+      "no-agent",
+      "on-hold"
+    ]
+  }
+}
