@@ -50,12 +50,12 @@ jobs:
 
           case "$SCENARIO" in
             live)
-              if ! pull_requests="$(gh pr list --repo "$GH_REPO" --state open --limit 100 --json number,isDraft,updatedAt 2>/dev/null)"; then
+              if ! pull_requests="$(gh pr list --repo "$GH_REPO" --state open --limit 100 --json number,isDraft,updatedAt,url,reviewDecision 2>/dev/null)"; then
                 summary '**Source status: FAILED** — pull request query was inaccessible or failed; this is not an empty queue.'
                 exit 1
               fi
 
-              if ! workflow_runs="$(gh run list --repo "$GH_REPO" --all --limit 100 --json databaseId,status,conclusion,createdAt 2>/dev/null)"; then
+              if ! workflow_runs="$(gh run list --repo "$GH_REPO" --all --limit 100 --json databaseId,status,conclusion,createdAt,updatedAt 2>/dev/null)"; then
                 summary '**Source status: FAILED** — workflow run query was inaccessible or failed; this is not an empty queue.'
                 exit 1
               fi
@@ -63,20 +63,66 @@ jobs:
               open_pr_count="$(jq 'length' <<< "$pull_requests")"
               draft_pr_count="$(jq '[.[] | select(.isDraft == true)] | length' <<< "$pull_requests")"
               run_count="$(jq 'length' <<< "$workflow_runs")"
-              failed_run_count="$(jq --arg run_id "$CURRENT_RUN_ID" '[.[] | select((.databaseId | tostring) != $run_id) | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "action_required")] | length' <<< "$workflow_runs")"
+              failed_runs="$(jq --arg run_id "$CURRENT_RUN_ID" '[.[] | select((.databaseId | tostring) != $run_id) | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "action_required")]' <<< "$workflow_runs")"
+              failed_run_count="$(jq 'length' <<< "$failed_runs")"
 
               summary '**Source status: FRESH** — both read-only GitHub queries succeeded.'
               summary ''
-              summary '| Queue signal | Count |'
-              summary '|---|---:|'
-              summary "| Open pull requests | $open_pr_count |"
-              summary "| Draft pull requests | $draft_pr_count |"
-              summary "| Workflow runs in latest 100 | $run_count |"
-              summary "| Failed/timed-out workflow runs (excluding this smoke run) | $failed_run_count |"
+              summary '| Type | Object | State | Last update | Reason | Source / suggested next action |'
+              summary '|---|---|---|---|---|---|'
+
+              while IFS=$'\t' read -r number is_draft review_decision updated_at; do
+                [[ -n "$number" ]] || continue
+                if [[ "$is_draft" == "true" ]]; then
+                  state='Draft'
+                  reason='Not yet marked ready for review'
+                  next_action='Review the draft and decide when it is ready'
+                else
+                  case "$review_decision" in
+                    REVIEW_REQUIRED)
+                      state='Review required'
+                      reason='No approving review is recorded'
+                      next_action='Request or complete human review'
+                      ;;
+                    CHANGES_REQUESTED)
+                      state='Changes requested'
+                      reason='A review requests changes'
+                      next_action='Inspect feedback; a human decides the next action'
+                      ;;
+                    APPROVED)
+                      state='Review approved'
+                      reason='Review is approved; CI/merge state still matters'
+                      next_action='Check required CI and leave merge to a human'
+                      ;;
+                    *)
+                      state='Review state unknown'
+                      reason='GitHub did not return a review decision'
+                      next_action='Inspect the source PR'
+                      ;;
+                  esac
+                fi
+                summary "| Pull request | #$number | $state | $updated_at | $reason | [Open source PR](https://github.com/$GH_REPO/pull/$number); $next_action |"
+              done < <(jq -r '.[] | [.number, (.isDraft|tostring), (.reviewDecision // "UNKNOWN"), .updatedAt] | @tsv' <<< "$pull_requests")
+
+              while IFS=$'\t' read -r run_id conclusion updated_at; do
+                [[ -n "$run_id" ]] || continue
+                summary "| CI workflow | Run #$run_id | $conclusion | $updated_at | Workflow run needs inspection | [Open source run](https://github.com/$GH_REPO/actions/runs/$run_id); inspect logs; no repair is launched |"
+              done < <(jq -r '.[] | [.databaseId, .conclusion, .updatedAt] | @tsv' <<< "$failed_runs")
+
+              if [[ "$open_pr_count" -eq 0 ]]; then
+                summary '| Pull request | — | None | — | No open pull requests found | Source query succeeded |'
+              fi
+              if [[ "$failed_run_count" -eq 0 ]]; then
+                summary '| CI workflow | — | None | — | No failed workflow runs found in the returned window | Source query succeeded |'
+              fi
+              summary ''
+              summary "- Draft PRs in open queue: $draft_pr_count"
+              summary "- Workflow runs queried (latest 100): $run_count"
+              summary '- Board approvals, blocked claims, agent questions, and repair-iteration limits: **NOT QUERIED** (test repo has no board configuration); this is not an empty result.'
 
               if [[ "$open_pr_count" -ge 100 || "$run_count" -ge 100 ]]; then
                 summary ''
-                summary '**Queue state: PARTIAL** — at least one source reached the 100-item query limit; do not treat this report as a complete empty queue.'
+                summary '**Queue state: PARTIAL** — at least one source reached the 100-item query limit; do not treat this report as a complete queue.'
               elif [[ "$open_pr_count" -eq 0 && "$failed_run_count" -eq 0 ]]; then
                 summary ''
                 summary '**Queue state: EMPTY** — sources were reachable and returned no actionable PR or failed-run items.'
@@ -89,10 +135,13 @@ jobs:
             sample)
               summary '**Source status: SIMULATED FIXTURE** — the following items are synthetic, not GitHub data.'
               summary ''
-              summary '| Type | Object | State | Reason for attention | Suggested next action |'
-              summary '|---|---|---|---|---|'
-              summary '| Pull request | Fixture PR #123 | Awaiting human review | Review decision pending | Review the PR in the source system |'
-              summary '| CI | Fixture run #456 | Failed | A required check failed | Inspect the run and decide whether action is needed |'
+              summary '| Type | Object | State | Age/last update | Reason for attention | Source / suggested next action |'
+              summary '|---|---|---|---|---|---|'
+              summary '| Pull request | Fixture PR #123 | Review required | Updated 2 hours ago (fixture) | No approving review | Fixture only; inspect the source PR in a real run |'
+              summary '| CI workflow | Fixture run #456 | Failed | Updated 15 minutes ago (fixture) | A check failed | Fixture only; inspect logs; no repair is launched |'
+              summary '| Board item | Fixture issue #789 | Blocked | Updated 1 day ago (fixture) | A dependency is unresolved | Fixture only; review blockers in the board |'
+              summary '| Agent question | Fixture issue #790 | Needs human decision | Updated 30 minutes ago (fixture) | Agent is waiting for clarification | Fixture only; answer in the source issue |'
+              summary '| Repair limit | Fixture PR #791 | Exhausted | Updated 3 hours ago (fixture) | Iteration limit reached | Fixture only; inspect the PR and decide whether to resume |'
               ;;
 
             stale-source)
