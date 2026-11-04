@@ -55,15 +55,16 @@ jobs:
                 exit 1
               fi
 
-              if ! workflow_runs="$(gh run list --repo "$GH_REPO" --all --limit 100 --json databaseId,status,conclusion,createdAt,updatedAt 2>/dev/null)"; then
+              if ! workflow_runs="$(gh run list --repo "$GH_REPO" --all --limit 100 --json databaseId,workflowName,status,conclusion,createdAt,updatedAt 2>/dev/null)"; then
                 summary '**Source status: FAILED** — workflow run query was inaccessible or failed; this is not an empty queue.'
                 exit 1
               fi
 
               open_pr_count="$(jq 'length' <<< "$pull_requests")"
               draft_pr_count="$(jq '[.[] | select(.isDraft == true)] | length' <<< "$pull_requests")"
-              run_count="$(jq 'length' <<< "$workflow_runs")"
-              failed_runs="$(jq --arg run_id "$CURRENT_RUN_ID" '[.[] | select((.databaseId | tostring) != $run_id) | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "action_required")]' <<< "$workflow_runs")"
+              tracked_runs="$(jq '[.[] | select(.workflowName != "Agent Inbox Smoke Test")]' <<< "$workflow_runs")"
+              run_count="$(jq 'length' <<< "$tracked_runs")"
+              failed_runs="$(jq --arg run_id "$CURRENT_RUN_ID" '[.[] | select((.databaseId | tostring) != $run_id) | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "action_required")]' <<< "$tracked_runs")"
               failed_run_count="$(jq 'length' <<< "$failed_runs")"
 
               summary '**Source status: FRESH** — both read-only GitHub queries succeeded.'
@@ -117,7 +118,7 @@ jobs:
               fi
               summary ''
               summary "- Draft PRs in open queue: $draft_pr_count"
-              summary "- Workflow runs queried (latest 100): $run_count"
+              summary "- Non-smoke workflow runs queried (latest 100): $run_count"
               summary '- Board approvals, blocked claims, agent questions, and repair-iteration limits: **NOT QUERIED** (test repo has no board configuration); this is not an empty result.'
 
               if [[ "$open_pr_count" -ge 100 || "$run_count" -ge 100 ]]; then
